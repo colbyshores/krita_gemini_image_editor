@@ -1,3 +1,36 @@
+Krita Gemini Image Editor
+The Krita Gemini Image Editor is a Python plugin that integrates the power of Google's Gemini generative AI directly into your Krita workflow. It allows you to perform complex, prompt-based edits on your images by leveraging the Gemini API to intelligently modify the content of the active layer.
+
+Features
+Seamless Integration: Adds a "Gemini Image Editor" action directly into Krita's Tools -> Scripts menu.
+Prompt-Based Editing: Use natural language to describe the changes you want to see in your image.
+Simple UI: A straightforward dialog lets you input your private Google Gemini API key and your text prompt.
+Layer-Specific: The plugin works on the currently active layer, leaving other layers untouched.
+Undoable Actions: Each AI-powered edit is registered as a single, atomic action in Krita's history, so you can easily undo it with Ctrl+Z.
+How It Works
+When you trigger the plugin, it captures the pixel data of the currently selected layer. This image data, along with the text prompt you provide, is sent securely to the Google Gemini API. The API processes the image based on your instructions and returns a new, modified image. The plugin then replaces the original content of your active layer with this new image from Gemini.
+
+Installation
+Open Krita.
+Navigate to the menu: Settings -> Manage Resources...
+In the resource manager window, click the Open Resource Folder button.
+This will open your system's file browser to Krita's main resource folder.
+From there, navigate into the pykrita subfolder.
+Copy the entire gemini_image_editor folder and the gemini_image_editor.desktop file into this pykrita folder.
+Restart Krita.
+Usage
+Open an image and select the layer you wish to edit.
+Navigate to the menu: Tools -> Scripts -> Gemini Image Editor...
+The Gemini Image Editor dialog will appear.
+In the "API Key" field, enter your personal Google Gemini API key.
+In the "Prompt" field, enter a description of the changes you want to make (e.g., "make the sky look like a sunset", "add a small boat on the water", "change the art style to watercolor").
+Click OK and wait for the operation to complete. The plugin will show status updates in its log window.
+Once finished, the active layer will be updated with the new image from Gemini. If you are not happy with the result, you can undo it by pressing Ctrl+Z.
+Requirements
+Krita (Version 5.0 or newer)
+An active internet connection
+A valid Google Gemini API key
+
 # Krita Plugin Packaging Guide
 
 This project provides instructions on how to properly package and distribute a Krita Python plugin.  
