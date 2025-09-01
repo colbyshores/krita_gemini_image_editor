@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Service
+ServiceTypes=Krita/PythonPlugin
+X-KDE-Library=gemini_image_editor
+Name=Gemini 2.5-Flash Image Plugin
+Comment=Gemini Image Editor
+
