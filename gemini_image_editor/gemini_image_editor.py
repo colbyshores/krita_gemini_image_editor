@@ -130,11 +130,8 @@ class GeminiDialog(QDialog):
         self.ok_button.clicked.connect(self.run_gemini_processing)
         self.cancel_button.clicked.connect(self.reject)
 
-        # plugin-level history (append-only list of raw RGBA bytes) and current index
-        self._history = []
-        self._current_index = -1
-        # map of snapshot hash -> index in _history for quick dedup checks
-        self._hash_map = {}
+    # (preview queue removed) store last snapshot only
+        self._last_snapshot = None
 
         # Left column controls
         left_v.addWidget(self.api_label)
@@ -161,17 +158,8 @@ class GeminiDialog(QDialog):
         left_v.addWidget(self.ok_button)
         left_v.addWidget(self.cancel_button)
 
-        # Right column: preview queue
-        self.preview_list = QListWidget()
-        self.preview_list.setIconSize(QSize(160, 90))
-        self.preview_list.setFixedWidth(180)
-        self.preview_list.itemClicked.connect(self._on_preview_selected)
-        right_v.addWidget(QLabel("Preview Queue"))
-        right_v.addWidget(self.preview_list)
-
         # Compose layouts
         main_h.addLayout(left_v)
-        main_h.addLayout(right_v)
 
         layout = QVBoxLayout()
         layout.addLayout(main_h)
@@ -205,96 +193,9 @@ class GeminiDialog(QDialog):
             self.node.setPixelData(qba, 0, 0, w, h)
             self.doc.refreshProjection()
 
-    def _add_snapshot(self, raw_bytes, label=None, append_to_end=False):
-        """Store snapshot in history and add thumbnail to preview list."""
-        # Normalize to Python bytes for consistent comparisons/storage
-        if isinstance(raw_bytes, QByteArray):
-            raw = bytes(raw_bytes)
-        else:
-            raw = raw_bytes
+    # _add_snapshot removed; plugin now stores only last snapshot in memory
 
-        # If we're not at the end of the history, truncate the branch (clear redo)
-        # By default we truncate when adding snapshots from user actions; however
-        # if append_to_end=True we will always append to the end and not truncate
-        # so prompt results won't overwrite selected previews.
-        if not append_to_end and self._current_index < len(self._history) - 1:
-            keep = self._current_index + 1
-            # remove preview items beyond keep
-            while self.preview_list.count() > keep:
-                itm = self.preview_list.takeItem(self.preview_list.count() - 1)
-                try:
-                    del itm
-                except Exception:
-                    pass
-            self._history = self._history[:keep]
-            # rebuild hash map for truncated history
-            self._hash_map = {}
-            for i, hraw in enumerate(self._history):
-                hh = hashlib.sha256(hraw).hexdigest()
-                self._hash_map[hh] = i
-            # ensure preview_list and history counts match
-            while self.preview_list.count() > len(self._history):
-                itm = self.preview_list.takeItem(self.preview_list.count() - 1)
-                try:
-                    del itm
-                except Exception:
-                    pass
-
-        # Deduplicate using SHA-256 checksum across the entire history.
-        new_hash = hashlib.sha256(raw).hexdigest()
-        if new_hash in self._hash_map:
-            # Already present somewhere in stack; set current index to existing
-            self._current_index = self._hash_map[new_hash]
-            try:
-                self.preview_list.setCurrentRow(self._current_index)
-            except Exception:
-                pass
-            return
-
-        # append to history and set current index to new snapshot
-        self._history.append(raw)
-        # store hash map entry for quick dedup checks
-        self._hash_map[new_hash] = len(self._history) - 1
-        # If append_to_end=True we want the new snapshot to be at the logical end
-        # of the stack, so set current index to the new last element.
-        self._current_index = len(self._history) - 1
-        # create QImage thumbnail
-        w = self.doc.width()
-        h = self.doc.height()
-        qimg = QImage(raw, w, h, w*4, QImage.Format_ARGB32)
-
-        if qimg.isNull():
-            # fallback: don't add preview
-            return
-
-        thumb = qimg.scaled(160, 90, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        pix = QPixmap.fromImage(thumb)
-        # create an item with no visible text; show label as tooltip only
-        item = QListWidgetItem()
-        item.setIcon(QIcon(pix))
-        tooltip = label if label else f"Snapshot {len(self._history)}"
-        item.setToolTip(tooltip)
-        # store raw bytes index in item data for quick restore
-        item.setData(Qt.UserRole, len(self._history)-1)
-        self.preview_list.addItem(item)
-        try:
-            self.preview_list.setCurrentRow(self._current_index)
-        except Exception:
-            pass
-
-    def _on_preview_selected(self, item):
-        idx = item.data(Qt.UserRole)
-        if idx is None:
-            self.append_chat('Selected preview has no data')
-            return
-        try:
-            raw = self._history[int(idx)]
-            # update current index and apply
-            self._current_index = int(idx)
-            self._apply_raw(raw)
-            self.append_chat('Applied selected preview snapshot.')
-        except Exception as e:
-            self.append_chat('Failed to apply preview: ' + str(e))
+    # Preview functionality removed; keep simple snapshot storage instead.
 
     def run_gemini_processing(self):
         self.ok_button.setEnabled(False)
@@ -320,9 +221,7 @@ class GeminiDialog(QDialog):
             # push current snapshot onto history before sending to Gemini
             try:
                 cur_raw = bytes(raw) if isinstance(raw, QByteArray) else raw
-                # Keep Original snapshot appended to the end so new prompts
-                # don't overwrite previews if the user has selected an earlier item.
-                self._add_snapshot(cur_raw, label="Original", append_to_end=True)
+                self._last_snapshot = cur_raw
             except Exception:
                 pass
             # Convert raw RGBA bytes -> PNG bytes
@@ -413,11 +312,10 @@ class GeminiDialog(QDialog):
                 raise RuntimeError(f"Converted pixel buffer has wrong size: {len(raw_out)} != {expected}")
             # add the returned image as a new snapshot and preview
             try:
-                # Always append Gemini results to the end of the preview stack
-                self._add_snapshot(raw_out, append_to_end=True)
-                # apply the raw_out
+                # store last snapshot and apply
+                self._last_snapshot = raw_out
                 self._apply_raw(raw_out)
-                self.append_chat("Done. (snapshot added to preview queue)")
+                self.append_chat("Done.")
             except Exception as e:
                 raise
         except Exception as e:
