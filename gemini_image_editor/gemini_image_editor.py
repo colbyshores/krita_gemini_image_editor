@@ -4,12 +4,55 @@
 # Place in Krita's pykrita/pykrita folder and restart Krita.
 
 from krita import Krita, Extension
-from PyQt5.QtWidgets import QDialog, QVBoxLayout, QLabel, QLineEdit, QTextEdit, QPushButton, QMessageBox, QListWidget, QListWidgetItem, QHBoxLayout
+from PyQt5.QtWidgets import QDialog, QVBoxLayout, QLabel, QLineEdit, QTextEdit, QPushButton, QMessageBox, QListWidget, QListWidgetItem, QHBoxLayout, QSpinBox, QProgressDialog, QApplication
 from PyQt5.QtGui import QImage, QPixmap, QIcon
-from PyQt5.QtCore import QByteArray, QBuffer, QIODevice, Qt, QSize
+from PyQt5.QtCore import QByteArray, QBuffer, QIODevice, Qt, QSize, QThread, pyqtSignal
 import base64, json, urllib.request, urllib.error, hashlib
 
 API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image-preview:generateContent"
+
+
+class FrameGenWorker(QThread):
+    """Background worker that generates frames by calling Gemini sequentially.
+
+    Emits:
+      progress(int, int) -> (index, total)
+      finished(list) -> list of PNG bytes
+      error(str) -> error message
+    """
+    progress = pyqtSignal(int, int)
+    finished = pyqtSignal(object)
+    error = pyqtSignal(str)
+
+    def __init__(self, api_key, prompt_base, png_in, frames_count, parent=None):
+        super().__init__(parent)
+        self.api_key = api_key
+        self.prompt_base = prompt_base
+        self.png_in = png_in
+        self.frames_count = int(frames_count)
+        self._stopped = False
+
+    def stop(self):
+        self._stopped = True
+
+    def run(self):
+        try:
+            results = []
+            for i in range(self.frames_count):
+                if self._stopped:
+                    break
+                frame_prompt = self.prompt_base + f" (animation frame {i+1} of {self.frames_count})"
+                try:
+                    out = call_gemini(self.api_key, frame_prompt, self.png_in)
+                except Exception as e:
+                    self.error.emit(str(e))
+                    return
+                results.append(out)
+                self.progress.emit(i + 1, self.frames_count)
+            self.finished.emit(results)
+        except Exception as e:
+            self.error.emit(str(e))
+
 
 # ----- Dialog ----- 
 class GeminiDialog(QDialog):
@@ -36,6 +79,17 @@ class GeminiDialog(QDialog):
         self.prompt_label = QLabel("Prompt:")
         self.prompt_entry = QLineEdit()
 
+        # Frames control for animation (1 = single image)
+        self.frames_label = QLabel("Frames:")
+        self.frames_spin = QSpinBox()
+        self.frames_spin.setRange(1, 60)
+        self.frames_spin.setValue(1)
+        # Frames-per-second control (for timeline settings)
+        self.fps_label = QLabel("FPS:")
+        self.fps_spin = QSpinBox()
+        self.fps_spin.setRange(1, 60)
+        self.fps_spin.setValue(12)
+
         self.chat_view = QTextEdit()
         self.chat_view.setReadOnly(True)
 
@@ -55,6 +109,10 @@ class GeminiDialog(QDialog):
         left_v.addWidget(self.api_entry)
         left_v.addWidget(self.prompt_label)
         left_v.addWidget(self.prompt_entry)
+        left_v.addWidget(self.frames_label)
+        left_v.addWidget(self.frames_spin)
+        left_v.addWidget(self.fps_label)
+        left_v.addWidget(self.fps_spin)
         left_v.addWidget(QLabel("Chat / Status:"))
         left_v.addWidget(self.chat_view)
         left_v.addWidget(self.ok_button)
@@ -227,9 +285,62 @@ class GeminiDialog(QDialog):
             # Convert raw RGBA bytes -> PNG bytes
             png_in = raw_rgba_to_png_bytes(raw, w, h)
 
+            frames_count = getattr(self, 'frames_spin', None) and int(self.frames_spin.value()) or 1
+
+            if frames_count > 1:
+                self.append_chat(f"Generating {frames_count} animation frames from prompt...")
+
+                progress = QProgressDialog("Generating frames...", "Cancel", 0, frames_count, self)
+                progress.setWindowTitle("Generating Animation")
+                progress.setWindowModality(Qt.WindowModal)
+                progress.setMinimumDuration(0)
+
+                # Worker will emit progress and finished signals
+                worker = FrameGenWorker(api_key, prompt, png_in, frames_count, parent=self)
+
+                def _on_progress(idx, total):
+                    progress.setValue(idx)
+                    self.append_chat(f"Contacting Gemini for frame {idx}/{total}...")
+
+                def _on_finished(results):
+                    progress.setValue(frames_count)
+                    if not results:
+                        self.append_chat("No frames were generated.")
+                        return
+                    try:
+                        raw_frames = [png_bytes_to_raw_rgba(fp, w, h) for fp in results]
+                        self._create_animation_from_frames(raw_frames, label=prompt)
+                        try:
+                            self._apply_raw(raw_frames[0])
+                        except Exception:
+                            pass
+                        self.append_chat("Done. Animation frames added (group/layers).")
+                    except Exception as e:
+                        self.append_chat(f"Error processing frames: {e}")
+
+                def _on_error(msg):
+                    progress.cancel()
+                    self.append_chat(f"Frame generation error: {msg}")
+
+                worker.progress.connect(_on_progress)
+                worker.finished.connect(_on_finished)
+                worker.error.connect(_on_error)
+
+                def _on_cancel():
+                    try:
+                        worker.stop()
+                    except Exception:
+                        pass
+
+                progress.canceled.connect(_on_cancel)
+                worker.start()
+                # keep worker referenced on the dialog so it doesn't get GC'd
+                self._frame_worker = worker
+                return
+
             self.append_chat("Contacting Gemini...")
             out_png = call_gemini(api_key, prompt, png_in)
-            self.append_chat("Received image from Gemini — applying to active layer...")
+            self.append_chat("Received image from Gemini  applying to active layer...")
 
             # --- Alpha Channel Debugging ---
             self.append_chat("Checking received image for transparency...")
@@ -260,6 +371,176 @@ class GeminiDialog(QDialog):
             QMessageBox.critical(self, "Gemini Error", str(e))
         finally:
             self.ok_button.setEnabled(True)
+
+    def _create_animation_from_frames(self, raw_frames, label=None):
+        """Create a group and one paint-layer per raw frame, then try to convert to timeline frames.
+
+        Best-effort conversion: create layers under a group and attempt to trigger a conversion action.
+        """
+        doc = self.doc
+        w = doc.width()
+        h = doc.height()
+        root = None
+        try:
+            root = doc.rootNode()
+        except Exception:
+            try:
+                root = doc.topLevelNode()
+            except Exception:
+                root = None
+
+        group_node = None
+        group_name = (label[:40] + "...") if label and len(label) > 40 else (label or "Generated Animation")
+        try:
+            if hasattr(doc, 'createNode'):
+                for typ in ('groupLayer', 'grouplayer', 'group'):
+                    try:
+                        try:
+                            group_node = doc.createNode(group_name, typ, doc)
+                        except TypeError:
+                            group_node = doc.createNode(group_name, typ)
+                        break
+                    except Exception:
+                        group_node = None
+                if group_node is not None and root is not None and hasattr(root, 'addChildNode'):
+                    try:
+                        root.addChildNode(group_node, None)
+                    except Exception:
+                        pass
+        except Exception:
+            group_node = None
+
+        created_nodes = []
+        for i, raw in enumerate(raw_frames):
+            node_name = f"{group_name} - frame {i+1}"
+            new_node = None
+            try:
+                if hasattr(doc, 'createNode'):
+                    for typ in ('paintLayer', 'paintlayer', 'paint'):
+                        try:
+                            try:
+                                new_node = doc.createNode(node_name, typ, doc)
+                            except TypeError:
+                                new_node = doc.createNode(node_name, typ)
+                            break
+                        except Exception:
+                            new_node = None
+                if new_node is None and hasattr(self.node, 'duplicate'):
+                    try:
+                        new_node = self.node.duplicate()
+                    except Exception:
+                        new_node = None
+
+                if new_node is None:
+                    self.append_chat(f"Could not create layer for frame {i+1}; skipping.")
+                    continue
+
+                parent = group_node if group_node is not None else root
+                if parent is not None and hasattr(parent, 'addChildNode'):
+                    try:
+                        parent.addChildNode(new_node, None)
+                    except Exception:
+                        pass
+
+                try:
+                    qba = QByteArray(raw)
+                    if hasattr(new_node, 'setPixelData'):
+                        new_node.setPixelData(qba, 0, 0, w, h)
+                    elif hasattr(new_node, 'setPixels'):
+                        new_node.setPixels(qba)
+                except Exception:
+                    pass
+
+                created_nodes.append(new_node)
+            except Exception as e:
+                self.append_chat(f"Failed to create/apply frame {i+1}: {e}")
+
+        try:
+            doc.refreshProjection()
+        except Exception:
+            pass
+
+        # Try to set fps on the document if available
+        try:
+            fps = getattr(self, 'fps_spin', None) and int(self.fps_spin.value()) or None
+            if fps is not None and hasattr(doc, 'setAnimationFPS'):
+                try:
+                    doc.setAnimationFPS(fps)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        converted = False
+        try:
+            app = Krita.instance()
+            # Try window-level actions first (Krita often exposes QAction via the active window)
+            window = None
+            try:
+                window = app.activeWindow()
+            except Exception:
+                window = None
+
+            # A list of likely action names to try on Krita 5.x
+            action_names = (
+                'convertLayersToFrames',
+                'convert_layers_to_frames',
+                'animation.convert_layers_to_frames',
+                'convertGroupToFrames',
+                'convert_group_to_frames',
+                'LayersToFrames',
+                'layer_convert_to_frames',
+            )
+
+            for act_name in action_names:
+                try:
+                    act = None
+                    if window is not None and hasattr(window, 'action'):
+                        try:
+                            act = window.action(act_name)
+                        except Exception:
+                            act = None
+                    if act is None and hasattr(app, 'action'):
+                        try:
+                            act = app.action(act_name)
+                        except Exception:
+                            act = None
+
+                    if act is not None:
+                        try:
+                            act.trigger()
+                            converted = True
+                            break
+                        except Exception:
+                            continue
+                except Exception:
+                    continue
+
+            # Fallback: try a convenience method on the group node itself
+            if not converted and group_node is not None:
+                if hasattr(group_node, 'convertToFrames'):
+                    try:
+                        group_node.convertToFrames()
+                        converted = True
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        # Try pinning created layers to timeline (Krita exposes pinning via layer properties in some builds)
+        try:
+            for n in created_nodes:
+                try:
+                    if hasattr(n, 'setPinnedToTimeline'):
+                        n.setPinnedToTimeline(True)
+                    elif hasattr(n, 'pinToTimeline'):
+                        n.pinToTimeline(True)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        if not converted:
+            self.append_chat("Note: automatic conversion to timeline frames not available; layers were created inside a group.")
 
 # ----- Utils: convert raw pixels -> PNG bytes ----- 
 def raw_rgba_to_png_bytes(raw_bytes, w, h):
