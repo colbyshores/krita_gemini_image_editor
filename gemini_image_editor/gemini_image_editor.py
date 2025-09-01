@@ -151,6 +151,10 @@ class GeminiDialog(QDialog):
         left_v.addWidget(self.guide_count_label)
         left_v.addWidget(self.guide_count_spin)
 
+        self.interpolate_checkbox = QCheckBox("Start animation from current image")
+        self.interpolate_checkbox.setChecked(True)
+        left_v.addWidget(self.interpolate_checkbox)
+
         left_v.addWidget(self.fps_label)
         left_v.addWidget(self.fps_spin)
         left_v.addWidget(QLabel("Chat / Status:"))
@@ -228,11 +232,27 @@ class GeminiDialog(QDialog):
             png_in = raw_rgba_to_png_bytes(raw, w, h)
 
             frames_count = getattr(self, 'frames_spin', None) and int(self.frames_spin.value()) or 1
+            interpolate = getattr(self, 'interpolate_checkbox', None) and bool(self.interpolate_checkbox.isChecked()) or False
 
             if frames_count > 1:
                 self.append_chat(f"Generating {frames_count} animation frames from prompt...")
 
-                progress = QProgressDialog("Generating frames...", "Cancel", 0, frames_count, self)
+                initial_raw = None
+                frames_to_generate = frames_count
+                if interpolate:
+                    initial_raw = bytes(raw)
+                    frames_to_generate = frames_count - 1
+
+                if frames_to_generate < 1:
+                    if initial_raw:
+                        self._create_animation_from_frames([initial_raw], label=prompt)
+                        self.append_chat("Done. Single-frame animation created from current image.")
+                    else:
+                        self.append_chat("Not enough frames to generate.")
+                    self.ok_button.setEnabled(True)
+                    return
+
+                progress = QProgressDialog("Generating frames...", "Cancel", 0, frames_to_generate, self)
                 progress.setWindowTitle("Generating Animation")
                 progress.setWindowModality(Qt.WindowModal)
                 progress.setMinimumDuration(0)
@@ -240,19 +260,22 @@ class GeminiDialog(QDialog):
                 # Worker will emit progress and finished signals
                 use_guides = getattr(self, 'guides_checkbox', None) and bool(self.guides_checkbox.isChecked()) or False
                 guide_count = getattr(self, 'guide_count_spin', None) and int(self.guide_count_spin.value()) or 2
-                worker = FrameGenWorker(api_key, prompt, png_in, frames_count, w, h, use_guides=use_guides, guide_count=guide_count, parent=self)
+                worker = FrameGenWorker(api_key, prompt, png_in, frames_to_generate, w, h, use_guides=use_guides, guide_count=guide_count, parent=self)
 
                 def _on_progress(idx, total):
                     progress.setValue(idx)
                     self.append_chat(f"Contacting Gemini for frame {idx}/{total}...")
 
                 def _on_finished(results):
-                    progress.setValue(frames_count)
-                    if not results:
+                    progress.setValue(frames_to_generate)
+                    if not results and not initial_raw:
                         self.append_chat("No frames were generated.")
                         return
                     try:
                         raw_frames = [png_bytes_to_raw_rgba(fp, w, h) for fp in results]
+                        if initial_raw:
+                            raw_frames.insert(0, initial_raw)
+
                         self._create_animation_from_frames(raw_frames, label=prompt)
                         try:
                             self._apply_raw(raw_frames[0])
