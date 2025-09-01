@@ -38,16 +38,24 @@ class FrameGenWorker(QThread):
     def run(self):
         try:
             results = []
+            current_png = self.png_in
             for i in range(self.frames_count):
                 if self._stopped:
                     break
-                frame_prompt = self.prompt_base + f" (animation frame {i+1} of {self.frames_count})"
+                # Nudge the prompt and request that Gemini use the previous frame as the base.
+                frame_prompt = (
+                    self.prompt_base
+                    + f" (animation frame {i+1} of {self.frames_count})"
+                    + " -- continue the animation from the provided image, evolving it slightly to the next frame"
+                )
                 try:
-                    out = call_gemini(self.api_key, frame_prompt, self.png_in)
+                    out = call_gemini(self.api_key, frame_prompt, current_png)
                 except Exception as e:
                     self.error.emit(str(e))
                     return
+                # store and use this output as the base for the next iteration
                 results.append(out)
+                current_png = out
                 self.progress.emit(i + 1, self.frames_count)
             self.finished.emit(results)
         except Exception as e:
@@ -474,47 +482,17 @@ class GeminiDialog(QDialog):
         converted = False
         try:
             app = Krita.instance()
-            # Try window-level actions first (Krita often exposes QAction via the active window)
             window = None
             try:
                 window = app.activeWindow()
             except Exception:
                 window = None
 
-            # A list of likely action names to try on Krita 5.x
-            action_names = (
-                'convertLayersToFrames',
-                'convert_layers_to_frames',
-                'animation.convert_layers_to_frames',
-                'convertGroupToFrames',
-                'convert_group_to_frames',
-                'LayersToFrames',
-                'layer_convert_to_frames',
-            )
-
-            for act_name in action_names:
-                try:
-                    act = None
-                    if window is not None and hasattr(window, 'action'):
-                        try:
-                            act = window.action(act_name)
-                        except Exception:
-                            act = None
-                    if act is None and hasattr(app, 'action'):
-                        try:
-                            act = app.action(act_name)
-                        except Exception:
-                            act = None
-
-                    if act is not None:
-                        try:
-                            act.trigger()
-                            converted = True
-                            break
-                        except Exception:
-                            continue
-                except Exception:
-                    continue
+            # Use helper to try known action names and trigger the first available
+            try:
+                converted = find_and_trigger_convert_action(app, window, dialog=self)
+            except Exception:
+                converted = False
 
             # Fallback: try a convenience method on the group node itself
             if not converted and group_node is not None:
@@ -522,6 +500,7 @@ class GeminiDialog(QDialog):
                     try:
                         group_node.convertToFrames()
                         converted = True
+                        self.append_chat("Used group_node.convertToFrames() as a fallback.")
                     except Exception:
                         pass
         except Exception:
@@ -644,6 +623,54 @@ def png_bytes_to_raw_rgba(png_bytes, w, h):
     if len(raw) > expected:
         raw = raw[:expected]
     return raw
+
+
+def find_and_trigger_convert_action(app, window, dialog=None):
+    """Try a set of likely action names and trigger the first one that exists.
+
+    Returns True if an action was found and triggered, False otherwise. If
+    `dialog` is provided and has `append_chat`, the function will write a
+    short status message so the user can see which action (if any) was used.
+    """
+    action_names = (
+        'convertLayersToFrames',
+        'convert_layers_to_frames',
+        'animation.convert_layers_to_frames',
+        'convertGroupToFrames',
+        'convert_group_to_frames',
+        'LayersToFrames',
+        'layer_convert_to_frames',
+    )
+
+    for act_name in action_names:
+        try:
+            act = None
+            if window is not None and hasattr(window, 'action'):
+                try:
+                    act = window.action(act_name)
+                except Exception:
+                    act = None
+            if act is None and hasattr(app, 'action'):
+                try:
+                    act = app.action(act_name)
+                except Exception:
+                    act = None
+
+            if act is not None:
+                try:
+                    act.trigger()
+                    if dialog is not None and hasattr(dialog, 'append_chat'):
+                        dialog.append_chat(f"Triggered Krita action '{act_name}' to convert layers -> frames.")
+                    return True
+                except Exception:
+                    # If trigger failed, continue trying other names
+                    continue
+        except Exception:
+            continue
+
+    if dialog is not None and hasattr(dialog, 'append_chat'):
+        dialog.append_chat("Automatic action trigger not found among known candidates.")
+    return False
 
 # ----- Compatibility undo/transaction context ----- 
 class _UndoContext:
