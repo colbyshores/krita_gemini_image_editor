@@ -4,8 +4,8 @@
 # Place in Krita's pykrita/pykrita folder and restart Krita.
 
 from krita import Krita, Extension
-from PyQt5.QtWidgets import QDialog, QVBoxLayout, QLabel, QLineEdit, QTextEdit, QPushButton, QMessageBox, QListWidget, QListWidgetItem, QHBoxLayout, QSpinBox, QProgressDialog, QApplication
-from PyQt5.QtGui import QImage, QPixmap, QIcon
+from PyQt5.QtWidgets import QDialog, QVBoxLayout, QLabel, QLineEdit, QTextEdit, QPushButton, QMessageBox, QListWidget, QListWidgetItem, QHBoxLayout, QSpinBox, QProgressDialog, QApplication, QCheckBox
+from PyQt5.QtGui import QImage, QPixmap, QIcon, QPainter, QColor, QPen
 from PyQt5.QtCore import QByteArray, QBuffer, QIODevice, Qt, QSize, QThread, pyqtSignal
 import base64, json, urllib.request, urllib.error, hashlib
 
@@ -24,12 +24,16 @@ class FrameGenWorker(QThread):
     finished = pyqtSignal(object)
     error = pyqtSignal(str)
 
-    def __init__(self, api_key, prompt_base, png_in, frames_count, parent=None):
+    def __init__(self, api_key, prompt_base, png_in, frames_count, w, h, use_guides=False, guide_count=2, parent=None):
         super().__init__(parent)
         self.api_key = api_key
         self.prompt_base = prompt_base
         self.png_in = png_in
         self.frames_count = int(frames_count)
+        self.w = int(w)
+        self.h = int(h)
+        self.use_guides = bool(use_guides)
+        self.guide_count = int(guide_count)
         self._stopped = False
 
     def stop(self):
@@ -49,7 +53,26 @@ class FrameGenWorker(QThread):
                     + " -- continue the animation from the provided image, evolving it slightly to the next frame"
                 )
                 try:
-                    out = call_gemini(self.api_key, frame_prompt, current_png)
+                    guide_png = None
+                    if self.use_guides:
+                        # Compute a simple motion path from center -> offset and generate guide image
+                        src = (self.w // 2, self.h // 2)
+                        # Destination is a small offset to the right and slightly up
+                        dst = (int(self.w * 0.2 + src[0]), int(src[1] - self.h * 0.1))
+                        # For multiple guide points, create intermediate targets along the path
+                        positions = []
+                        for g in range(self.guide_count):
+                            t = float(g) / max(1, self.guide_count - 1)
+                            x = int(src[0] + (dst[0] - src[0]) * t)
+                            y = int(src[1] + (dst[1] - src[1]) * t)
+                            positions.append((x, y))
+                        # Highlight the target for this frame (interpolated along path)
+                        tframe = float(i + 1) / max(1, self.frames_count)
+                        hx = int(src[0] + (dst[0] - src[0]) * tframe)
+                        hy = int(src[1] + (dst[1] - src[1]) * tframe)
+                        guide_png = create_motion_guide_png_bytes(self.w, self.h, positions, (hx, hy))
+
+                    out = call_gemini(self.api_key, frame_prompt, current_png, guide_png)
                 except Exception as e:
                     self.error.emit(str(e))
                     return
@@ -113,21 +136,32 @@ class GeminiDialog(QDialog):
         # map of snapshot hash -> index in _history for quick dedup checks
         self._hash_map = {}
 
+        # Left column controls
         left_v.addWidget(self.api_label)
         left_v.addWidget(self.api_entry)
         left_v.addWidget(self.prompt_label)
         left_v.addWidget(self.prompt_entry)
         left_v.addWidget(self.frames_label)
         left_v.addWidget(self.frames_spin)
+
+        # Motion guide controls
+        self.guides_checkbox = QCheckBox("Use motion guides")
+        self.guide_count_label = QLabel("Guide points:")
+        self.guide_count_spin = QSpinBox()
+        self.guide_count_spin.setRange(1, 8)
+        self.guide_count_spin.setValue(2)
+        left_v.addWidget(self.guides_checkbox)
+        left_v.addWidget(self.guide_count_label)
+        left_v.addWidget(self.guide_count_spin)
+
         left_v.addWidget(self.fps_label)
         left_v.addWidget(self.fps_spin)
         left_v.addWidget(QLabel("Chat / Status:"))
         left_v.addWidget(self.chat_view)
         left_v.addWidget(self.ok_button)
         left_v.addWidget(self.cancel_button)
-        # ...undo/redo removed
 
-        # --- right column: preview queue ---
+        # Right column: preview queue
         self.preview_list = QListWidget()
         self.preview_list.setIconSize(QSize(160, 90))
         self.preview_list.setFixedWidth(180)
@@ -135,6 +169,7 @@ class GeminiDialog(QDialog):
         right_v.addWidget(QLabel("Preview Queue"))
         right_v.addWidget(self.preview_list)
 
+        # Compose layouts
         main_h.addLayout(left_v)
         main_h.addLayout(right_v)
 
@@ -304,7 +339,9 @@ class GeminiDialog(QDialog):
                 progress.setMinimumDuration(0)
 
                 # Worker will emit progress and finished signals
-                worker = FrameGenWorker(api_key, prompt, png_in, frames_count, parent=self)
+                use_guides = getattr(self, 'guides_checkbox', None) and bool(self.guides_checkbox.isChecked()) or False
+                guide_count = getattr(self, 'guide_count_spin', None) and int(self.guide_count_spin.value()) or 2
+                worker = FrameGenWorker(api_key, prompt, png_in, frames_count, w, h, use_guides=use_guides, guide_count=guide_count, parent=self)
 
                 def _on_progress(idx, total):
                     progress.setValue(idx)
@@ -346,8 +383,17 @@ class GeminiDialog(QDialog):
                 self._frame_worker = worker
                 return
 
+            use_guides = getattr(self, 'guides_checkbox', None) and bool(self.guides_checkbox.isChecked()) or False
+            guide_count = getattr(self, 'guide_count_spin', None) and int(self.guide_count_spin.value()) or 2
+            guide_png = None
+            if use_guides:
+                # simple guide for single frame: one destination offset
+                src = (w // 2, h // 2)
+                dst = (int(w * 0.2 + src[0]), int(src[1] - h * 0.1))
+                positions = [src, dst]
+                guide_png = create_motion_guide_png_bytes(w, h, positions, dst)
             self.append_chat("Contacting Gemini...")
-            out_png = call_gemini(api_key, prompt, png_in)
+            out_png = call_gemini(api_key, prompt, png_in, guide_png)
             self.append_chat("Received image from Gemini  applying to active layer...")
 
             # --- Alpha Channel Debugging ---
@@ -545,8 +591,63 @@ def raw_rgba_to_png_bytes(raw_bytes, w, h):
     buffer.close()
     return png_bytes
 
+
+def create_motion_guide_png_bytes(w, h, points, highlight_point=None):
+    """Create a small transparent PNG with motion guide lines and points.
+
+    - points: list of (x,y) tuples representing path anchors
+    - highlight_point: (x,y) tuple to mark the current destination
+    Returns PNG bytes.
+    """
+    img = QImage(w, h, QImage.Format_ARGB32)
+    img.fill(Qt.transparent)
+    painter = QPainter(img)
+    try:
+        pen = QPen(QColor(255, 128, 0, 200))
+        pen.setWidth(3)
+        painter.setPen(pen)
+        # Draw path lines
+        if len(points) >= 2:
+            for a, b in zip(points[:-1], points[1:]):
+                painter.drawLine(a[0], a[1], b[0], b[1])
+        # Draw small circles for anchor points
+        for p in points:
+            painter.setBrush(QColor(255, 200, 0, 180))
+            painter.drawEllipse(p[0]-6, p[1]-6, 12, 12)
+        # Highlight destination
+        if highlight_point:
+            hp = highlight_point
+            pen2 = QPen(QColor(0, 200, 255, 220))
+            pen2.setWidth(4)
+            painter.setPen(pen2)
+            painter.setBrush(QColor(0, 200, 255, 120))
+            painter.drawEllipse(hp[0]-10, hp[1]-10, 20, 20)
+    finally:
+        painter.end()
+    buf = QBuffer()
+    buf.open(QIODevice.ReadWrite)
+    ok = img.save(buf, 'PNG')
+    buf.seek(0)
+    if not ok:
+        buf.close()
+        raise RuntimeError('Failed to create guide PNG')
+    out = buf.data().data() if hasattr(buf.data(), 'data') else bytes(buf.data())
+    buf.close()
+    return out
+
 # ----- Gemini call ----- 
-def call_gemini(api_key, prompt, png_bytes):
+def call_gemini(api_key, prompt, png_bytes, guide_png=None):
+    # Backwards-compatible signature: callers may pass a 4th arg guide_png
+    guide_png = None
+    try:
+        # If caller passed 4 args, capture guide_png from locals (FrameGenWorker does this)
+        import inspect
+        frame = inspect.currentframe().f_back
+        args = frame.f_locals
+        if 'guide_png' in args:
+            guide_png = args.get('guide_png')
+    except Exception:
+        guide_png = None
     body = {
         "contents": [
             {
@@ -560,6 +661,20 @@ def call_gemini(api_key, prompt, png_bytes):
             }
         ]
     }
+    # If a guide image was passed, include it as a second inline_data part.
+    if guide_png:
+        try:
+            body['contents'][0]['parts'].append({
+                'text': 'motion_guide',
+            })
+            body['contents'][0]['parts'].append({
+                'inline_data': {
+                    'mime_type': 'image/png',
+                    'data': base64.b64encode(guide_png).decode('utf-8')
+                }
+            })
+        except Exception:
+            pass
     data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(API_URL, data=data, headers={
         "Content-Type": "application/json",
