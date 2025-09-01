@@ -1,6 +1,3 @@
-Got it — here’s the polished `README.md` in proper markdown format, updated to specify **Pop!\_OS 22.04**.
-
-```markdown
 # Krita Plugin Packaging Guide
 
 This project provides instructions on how to properly package and distribute a Krita Python plugin.  
@@ -88,12 +85,3 @@ Functionality and packaging confirmed working in this setup. Behavior on other s
 * [Krita Plugin Examples](https://invent.kde.org/graphics/krita-plugins)
 
 ---
-
-## 📝 License
-
-Include your license information here (e.g., GPLv3, MIT, etc.).
-
-```
-
-Do you also want me to add **starter templates for `__init__.py` and `plugin.py`** in this README so it’s a full “copy-paste and run” guide?
-```
